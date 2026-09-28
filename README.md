@@ -1,16 +1,24 @@
 # Loan Detector
 
-Exploring what drives loan default and loan approval risk across three independent
-lending datasets, and building baseline classifiers (Logistic Regression + Random
-Forest) for each.
+Exploring what drives loan default and loan approval risk across four lending datasets
+that don't share a join key, a schema, or even always the same target — and turning that
+into two things: **Part 1** builds a baseline classifier per dataset, and **Part 2** builds
+one model that generalizes across products and uses it to flag risk in a dataset that has
+no default label of its own.
 
 ## Datasets
 
 | Label (used in code) | Source file | Rows | Columns | Target | Positive rate |
 |---|---|---|---|---|---|
-| Credit Risk | `raw_data/Loan_default.csv` | 255,347 | 18 | `Default` | ~11.6% |
-| Demographic | `raw_data/Loan_approval.csv` | 50,000 | 20 | `loan_status` | TBD |
-| Behavioral | `raw_data/UCI.csv` (UCI "Default of Credit Card Clients") | 30,000 | 25 | `default.payment.next.month` | TBD |
+| Credit Risk | `raw_data/Loan_default.csv` | 255,347 | 18 | `Default` | 11.6% |
+| Demographic | `raw_data/Loan_approval.csv` | 50,000 | 20 | `loan_status`* | 55.0% |
+| Behavioral | `raw_data/UCI.csv` (UCI "Default of Credit Card Clients") | 30,000 | 25 | `default.payment.next.month` | 22.1% |
+| Mortgage | `raw_data/Loan_Default.csv` (newly added — see Part 2) | 148,670 | 34 | `Status` | 24.6% |
+
+\* **Important:** `loan_status` is an *approval decision* (1 = approved), not a default outcome —
+a 55% positive rate is far too high to be a default rate, and the "1" group has *better*
+credit profiles, not worse. This dataset answers "would this application get approved?", a
+different question from "will this loan default?" See Part 2 for how it's actually used.
 
 All three are independent binary classification problems — each dataset is modeled
 separately rather than merged.
@@ -82,18 +90,36 @@ account balances do.
 ## Modeling
 
 **Approach:** 80/20 stratified train/test split → features standardized (`StandardScaler`)
-for Logistic Regression only → both models trained with `class_weight='balanced'` to
-account for class imbalance → evaluated on ROC-AUC and PR-AUC (PR-AUC matters more here
-given the minority class is only ~11.6% of the Credit Risk data).
+for Logistic Regression only → Logistic Regression and Random Forest trained with
+`class_weight='balanced'`, Gradient Boosting trained with equivalent balanced
+`sample_weight`s (it has no `class_weight` argument) → evaluated on ROC-AUC, PR-AUC
+(matters more here given the minority class is only ~11.6% of the Credit Risk data),
+and Brier score (calibration quality — see below).
 
-| Dataset | Model | ROC-AUC | PR-AUC | Precision (positive class) | Recall (positive class) |
-|---|---|---|---|---|---|
-| Credit Risk | Logistic Regression | 0.760 | 0.334 | 0.227 | 0.696 |
-| Credit Risk | Random Forest | 0.754 | 0.323 | 0.260 | 0.581 |
-| Demographic | Logistic Regression | *pending* | *pending* | – | – |
-| Demographic | Random Forest | *pending* | *pending* | – | – |
-| Behavioral | Logistic Regression | *pending* | *pending* | – | – |
-| Behavioral | Random Forest | *pending* | *pending* | – | – |
+| Dataset | Model | ROC-AUC | PR-AUC | Brier | Precision (positive class) | Recall (positive class) |
+|---|---|---|---|---|---|---|
+| Credit Risk | Logistic Regression | 0.760 | 0.334 | *pending* | 0.227 | 0.696 |
+| Credit Risk | Random Forest | 0.754 | 0.323 | *pending* | 0.260 | 0.581 |
+| Credit Risk | Gradient Boosting | *pending* | *pending* | *pending* | – | – |
+| Demographic | Logistic Regression | *pending* | *pending* | *pending* | – | – |
+| Demographic | Random Forest | *pending* | *pending* | *pending* | – | – |
+| Demographic | Gradient Boosting | *pending* | *pending* | *pending* | – | – |
+| Behavioral | Logistic Regression | *pending* | *pending* | *pending* | – | – |
+| Behavioral | Random Forest | *pending* | *pending* | *pending* | – | – |
+| Behavioral | Gradient Boosting | *pending* | *pending* | *pending* | – | – |
+
+Gradient Boosting and the Brier score column are new — the Credit Risk LogReg/RF numbers
+above are from the original run and predate both, hence "pending" next to them too.
+
+### Model Calibration (Reliability Diagrams)
+
+The notebook now also plots a reliability diagram per dataset (predicted probability vs.
+actual fraction of positives) for all three models. This checks something ROC-AUC and
+PR-AUC don't: whether a predicted probability of 0.7 really means "70% of similar cases
+defaulted." It's a useful check here specifically because every model is trained with
+balanced class/sample weights, which tends to push predicted probabilities away from the
+true base rate — worth confirming rather than assuming, before those probabilities get
+used for anything like a risk score or a cutoff.
 
 Logistic Regression and Random Forest perform similarly on Credit Risk (ROC-AUC ~0.75–0.76),
 but Logistic Regression catches more actual defaulters (69.6% recall vs. 58.1%) at the
@@ -120,6 +146,63 @@ top risk signals, but the Random Forest ranks `Age` highest — suggesting age h
 nonlinear relationship with default risk that a simple correlation coefficient
 understates.
 
+## Part 2: Cross-Dataset Default Risk Scoring
+
+**The problem:** the three Part 1 models were each trained on their own dataset's full,
+native feature set — none of that transfers directly to a dataset built for a different
+purpose. `Loan_approval.csv` has no default label at all (see the footnote above), so it
+can't be evaluated the normal way. Instead, the goal here is to build a model that predicts
+*genuine* default risk, trained only on datasets with a real default label, then use it to
+score `Loan_approval.csv`'s applicants and see where the current accept/reject split might
+be missing risk.
+
+**Which sources go where, and why:**
+- `Loan_default.csv` (personal loans, real `Default` label) + `Loan_Default.csv` (mortgages,
+  real `Status` label) → **pooled for training.** Both have a genuine default outcome and a
+  comparable "loan application" feature vocabulary (income, credit score, rate, DTI, age).
+- `UCI.csv` (credit cards) → **left out of the pooled model.** It has a real default label
+  too, but its features (repayment history, bill amounts) don't overlap with the other
+  three at all — pooling it in would mean imputing away most of what makes it useful.
+  It stays as its own standalone model in Part 1.
+- `Loan_approval.csv` → **scoring target only**, since it has no default label to train on.
+
+**Harmonization fixes required** (found by inspecting the real mortgage data, not assumed):
+
+| Issue | Fix |
+|---|---|
+| `age` is binned as text (`"25-34"`) | Converted to numeric bin midpoints |
+| `income` is monthly, others are annual | Multiplied by 12 |
+| `dtir1` is on a 0–100 scale, others are 0–1 | Divided by 100 |
+| Mortgage loan amounts run ~10x personal loan amounts | Used loan-to-income ratio instead of raw dollars |
+| `Credit_Score` uses a 500–900 scale, others use ~300–850 | Kept raw + added a `loan_product` flag so the tree model can split per-product rather than assume the scales match |
+| 0.85% of mortgage rows report $0 income (÷0 in the ratio above) | Treated as missing, median-imputed |
+
+**Calibration mattered more here than anywhere else in this project.** Both pooled models
+are trained with `class_weight='balanced'`, which trains as if defaults were ~50% of the
+data. Confirmed on real data: the raw model's *average* predicted probability on held-out
+data was 0.35–0.38, against a true default rate of 0.16–0.17 — more than double. Isotonic
+calibration (5-fold internal cross-fitting) brought the average prediction back in line with
+the true rate almost exactly, while ROC-AUC barely moved (calibration fixes the scale, not
+the ranking). Using the *raw* model to flag risk in `Loan_approval.csv` flagged 98% of
+approved loans as "high risk" — meaningless. The calibrated model gives a usable answer.
+
+**Validated findings** (real data, checked on a representative subsample twice for
+consistency — this development environment has 1 CPU core, so the full ~400K-row fit runs
+in the notebook itself rather than here; expect the exact numbers to shift slightly at full
+scale, but not the story):
+
+- The pooled model separates mortgage defaults far more easily than personal-loan defaults
+  on these 6 shared features (ROC-AUC ~0.97 vs. ~0.72–0.73 on held-out data of each type) —
+  a reminder that "generalizable" doesn't mean "equally strong everywhere."
+- Scoring `Loan_approval.csv` with the calibrated model and flagging at the pooled base
+  default rate: **roughly 8–10% of currently-approved loans look high-risk**, and
+  **roughly 65–70% of denied applicants look low-risk**, by this model.
+
+**Read that second number carefully.** It's not proof the denials were wrong. The
+harmonized model only sees six general features — real underwriting likely used
+information this model doesn't have (verification, fraud checks, policy exceptions). Treat
+it as a prioritized list for manual review, not an auto-override.
+
 ## Key Takeaways So Far
 
 - **Behavioral history beats demographics.** In both datasets where a repayment-history
@@ -137,13 +220,23 @@ understates.
 
 ## Next Steps
 
-- [ ] Run the (now-fixed) pipeline on the Demographic and Behavioral datasets to fill in
-      the modeling table above.
-- [ ] Compare all three datasets on equal footing and decide whether a single unified
-      model or three separate models is the right framing.
-- [ ] Try a gradient-boosted model (XGBoost/LightGBM) as a stronger baseline than Random Forest.
-- [ ] Tune the classification threshold instead of using the default 0.5, given the
-      class imbalance.
+- [x] Add Gradient Boosting as a third model alongside Logistic Regression and Random Forest.
+- [x] Add reliability diagrams and Brier score to check probability calibration.
+- [x] Harmonize Loan_default + Loan_Default (mortgages) into one pooled, cross-product
+      default-risk model.
+- [x] Calibrate the pooled model and use it to score `Loan_approval.csv`.
+- [ ] Re-run the full pipeline on real, full-scale data to replace every "pending"/validated
+      number above with the exact final figure.
+- [ ] Pick a threshold more deliberately than "pooled base rate" — a cost-based threshold
+      (expected loss from a missed default vs. a foregone good loan) would be more
+      defensible for the Part 2 risk-flagging table.
+- [ ] For the "denied but flagged low-risk" group, check whether `Loan_approval.csv` has
+      any fields hinting at *why* they were denied (fraud flags, verification failures)
+      before treating that group as a real missed-opportunity list.
+- [ ] Compare all three Part 1 datasets on equal footing and decide whether a single
+      unified model or three separate models is the right framing there too.
+- [ ] Try XGBoost/LightGBM as a stronger, faster-training alternative to sklearn's
+      Gradient Boosting — likely to help most on the single-core-unfriendly pooled fit.
 - [ ] Investigate the `Age` feature's nonlinear importance in the Credit Risk Random Forest
       (e.g. partial dependence plot).
 
@@ -153,6 +246,7 @@ understates.
 ├── Loan_Detector.ipynb
 ├── raw_data/
 │   ├── Loan_default.csv
+│   ├── Loan_Default.csv    # new: mortgage loans, used in Part 2
 │   ├── Loan_approval.csv
 │   └── UCI.csv
 └── README.md
